@@ -13,6 +13,7 @@
 // ========= Copyright 2025-2026 @ Eigent.ai All Rights Reserved. =========
 
 import { Button } from '@/components/ui/button';
+import { SITE_URL } from '@/lib';
 import { useAuthStore } from '@/store/authStore';
 import { useStackApp } from '@stackframe/react';
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -32,6 +33,7 @@ import { hasStackKeys } from '@/lib';
 import { useTranslation } from 'react-i18next';
 
 const HAS_STACK_KEYS = hasStackKeys();
+const IS_LOCAL_MODE = import.meta.env.VITE_USE_LOCAL_PROXY === 'true';
 let lock = false;
 export default function SignUp() {
   // Always call hooks unconditionally - React Hooks must be called in the same order
@@ -40,6 +42,21 @@ export default function SignUp() {
   const { setAuth, initState: _initState } = useAuthStore();
   const navigate = useNavigate();
   const location = useLocation();
+
+  // Local mode: no signup needed, redirect to home
+  useEffect(() => {
+    if (IS_LOCAL_MODE) {
+      navigate('/', { replace: true });
+    }
+  }, [navigate]);
+
+  // Hybrid/app mode without Stack keys: redirect to external signup
+  useEffect(() => {
+    if (!IS_LOCAL_MODE && !HAS_STACK_KEYS) {
+      window.open(`${SITE_URL}/signup`, '_blank', 'noopener,noreferrer');
+      navigate('/login', { replace: true });
+    }
+  }, [navigate]);
   const [hidePassword, setHidePassword] = useState(true);
   const { t } = useTranslation();
   const [formData, setFormData] = useState({
@@ -111,7 +128,7 @@ export default function SignUp() {
     setGeneralError('');
     setIsLoading(true);
     try {
-      const data = await proxyFetchPost('/api/register', {
+      const data = await proxyFetchPost('/api/v1/register', {
         email: formData.email,
         password: formData.password,
         invite_code: formData.invite_code,
@@ -155,7 +172,7 @@ export default function SignUp() {
     async (token: string) => {
       try {
         const data = await proxyFetchPost(
-          '/api/login-by_stack?token=' + token,
+          '/api/v1/login-by_stack?token=' + token,
           {
             token: token,
             invite_code: localStorage.getItem('invite_code') || '',
@@ -204,14 +221,14 @@ export default function SignUp() {
       console.log(
         'import.meta.env.PROD',
         import.meta.env.PROD
-          ? `${import.meta.env.VITE_BASE_URL}/api/redirect/callback`
-          : `${import.meta.env.VITE_PROXY_URL}/api/redirect/callback`
+          ? `${import.meta.env.VITE_BASE_URL}/api/v1/redirect/callback`
+          : `${import.meta.env.VITE_PROXY_URL}/api/v1/redirect/callback`
       );
       formData.append(
         'redirect_uri',
         import.meta.env.PROD
-          ? `${import.meta.env.VITE_BASE_URL}/api/redirect/callback`
-          : `${import.meta.env.VITE_PROXY_URL}/api/redirect/callback`
+          ? `${import.meta.env.VITE_BASE_URL}/api/v1/redirect/callback`
+          : `${import.meta.env.VITE_PROXY_URL}/api/v1/redirect/callback`
       );
       formData.append('code_verifier', code_verifier || '');
       formData.append('code', code);
@@ -434,19 +451,6 @@ export default function SignUp() {
               </span>
             </Button>
           </div>
-          <Button
-            variant="ghost"
-            size="xs"
-            onClick={() =>
-              window.open(
-                'https://www.eigent.ai/privacy-policy',
-                '_blank',
-                'noopener,noreferrer'
-              )
-            }
-          >
-            {t('layout.privacy-policy')}
-          </Button>
         </div>
       </div>
     </div>
