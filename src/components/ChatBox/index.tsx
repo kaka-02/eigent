@@ -18,22 +18,176 @@ import {
   fetchPut,
   proxyFetchDelete,
   proxyFetchGet,
-  proxyFetchPut,
 } from '@/api/http';
 import useChatStoreAdapter from '@/hooks/useChatStoreAdapter';
-import { generateUniqueId, replayActiveTask } from '@/lib';
+import { generateUniqueId, replayActiveTask, SITE_URL } from '@/lib';
 import { proxyUpdateTriggerExecution } from '@/service/triggerApi';
 import { useAuthStore } from '@/store/authStore';
+import type { VanillaChatStore } from '@/store/chatStore';
 import { ExecutionStatus } from '@/types';
 import { AgentStep, ChatTaskStatus } from '@/types/constants';
 import { TriangleAlert } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { useNavigate, useSearchParams } from 'react-router-dom';
+import { useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { toast } from 'sonner';
 import BottomBox from './BottomBox';
 import { HeaderBox } from './HeaderBox';
 import { ProjectChatContainer } from './ProjectChatContainer';
+
+const getChatStoreTotalTokens = (chatStore: VanillaChatStore): number => {
+  const chatState = chatStore.getState();
+  return Object.values(chatState.tasks).reduce(
+    (total, task) =>
+      total + (typeof task.tokens === 'number' ? task.tokens : 0),
+    0
+  );
+};
+
+const USAGE_WARNING_RATIO = 0.75;
+const FREE_STARTING_CREDITS = 500;
+const API_CODE_TRIAL_LIMIT = '22';
+
+interface SubscriptionLimitInfo {
+  plan_key?: string | null;
+  is_trialing?: boolean | null;
+  monthly_credits?: number | null;
+  trial_daily_credits_limit?: number | null;
+  trial_daily_credits_used?: number | null;
+  trial_daily_credits_remaining?: number | null;
+  trial_total_credits_limit?: number | null;
+  trial_total_credits_used?: number | null;
+  trial_total_credits_remaining?: number | null;
+}
+
+interface UsageLimitBannerState {
+  id: string;
+  message: string;
+  actionLabel: string;
+  severity: 'warning' | 'danger';
+}
+
+const toFiniteNumber = (value: unknown): number | null =>
+  typeof value === 'number' && Number.isFinite(value) ? value : null;
+
+const usagePercent = (used: number, limit: number) =>
+  Math.min(100, Math.max(0, Math.round((used / limit) * 100)));
+
+const hasApiCode = (value: unknown, code: string) =>
+  typeof value === 'object' &&
+  value !== null &&
+  String((value as { code?: unknown }).code) === code;
+
+const buildUsageLimitBannerState = (
+  subscription: SubscriptionLimitInfo | null,
+  currentCredits: number | null,
+  t: (key: string, options?: Record<string, unknown>) => string
+): UsageLimitBannerState | null => {
+  const actionLabel = t('chat.usage-limit-action');
+
+  if (subscription?.is_trialing) {
+    const trialCandidates = [
+      {
+        id: 'trial-daily',
+        warningKey: 'chat.usage-limit-trial-daily-warning',
+        exhaustedKey: 'chat.usage-limit-trial-daily-exhausted',
+        limit: toFiniteNumber(subscription.trial_daily_credits_limit),
+        used: toFiniteNumber(subscription.trial_daily_credits_used),
+        remaining: toFiniteNumber(subscription.trial_daily_credits_remaining),
+      },
+      {
+        id: 'trial-total',
+        warningKey: 'chat.usage-limit-trial-total-warning',
+        exhaustedKey: 'chat.usage-limit-trial-total-exhausted',
+        limit: toFiniteNumber(subscription.trial_total_credits_limit),
+        used: toFiniteNumber(subscription.trial_total_credits_used),
+        remaining: toFiniteNumber(subscription.trial_total_credits_remaining),
+      },
+    ]
+      .map((candidate) => {
+        if (!candidate.limit || candidate.limit <= 0 || candidate.used === null)
+          return null;
+
+        const remaining =
+          candidate.remaining ?? Math.max(candidate.limit - candidate.used, 0);
+        const ratio = candidate.used / candidate.limit;
+        const exhausted = remaining <= 0 || candidate.used >= candidate.limit;
+
+        if (!exhausted && ratio < USAGE_WARNING_RATIO) return null;
+
+        const percent = usagePercent(candidate.used, candidate.limit);
+        return {
+          id: `${candidate.id}:${exhausted ? 'exhausted' : 'warning'}`,
+          message: t(
+            exhausted ? candidate.exhaustedKey : candidate.warningKey,
+            {
+              percent,
+            }
+          ),
+          actionLabel,
+          severity: exhausted ? ('danger' as const) : ('warning' as const),
+          ratio,
+          exhausted,
+        };
+      })
+      .filter(Boolean)
+      .sort((a, b) => {
+        if (a!.exhausted !== b!.exhausted) {
+          return a!.exhausted ? -1 : 1;
+        }
+        return b!.ratio - a!.ratio;
+      });
+
+    if (trialCandidates[0]) {
+      const {
+        ratio: _ratio,
+        exhausted: _exhausted,
+        ...banner
+      } = trialCandidates[0];
+      return banner;
+    }
+  }
+
+  if (currentCredits === null) return null;
+
+  if (currentCredits <= 0) {
+    const planKey = subscription?.plan_key?.toLowerCase() || 'free';
+    return {
+      id: `credits-exhausted:${planKey}`,
+      message: t(
+        planKey === 'free'
+          ? 'chat.usage-limit-free-exhausted'
+          : 'chat.usage-limit-monthly-exhausted'
+      ),
+      actionLabel,
+      severity: 'danger',
+    };
+  }
+
+  const planKey = subscription?.plan_key?.toLowerCase() || 'free';
+  const limit =
+    planKey === 'free'
+      ? FREE_STARTING_CREDITS
+      : toFiniteNumber(subscription?.monthly_credits);
+
+  if (!limit || limit <= 0) return null;
+
+  const remainingRatio = currentCredits / limit;
+  if (remainingRatio > 1 - USAGE_WARNING_RATIO) return null;
+
+  const percent = usagePercent(limit - currentCredits, limit);
+  return {
+    id: `${planKey === 'free' ? 'free' : 'monthly'}-credits:warning`,
+    message: t(
+      planKey === 'free'
+        ? 'chat.usage-limit-free-warning'
+        : 'chat.usage-limit-monthly-warning',
+      { percent }
+    ),
+    actionLabel,
+    severity: 'warning',
+  };
+};
 
 export default function ChatBox(): JSX.Element {
   const [message, setMessage] = useState<string>('');
@@ -43,13 +197,104 @@ export default function ChatBox(): JSX.Element {
 
   const { t } = useTranslation();
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const [hasModel, setHasModel] = useState(true);
+  const [hasModel, setHasModel] = useState(false);
+  const [isConfigLoaded, setIsConfigLoaded] = useState(false);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
-  const [privacy, setPrivacy] = useState<any>(false);
   const [_hasSearchKey, setHasSearchKey] = useState<any>(false);
   const scrollTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-  // const [privacyDialogOpen, setPrivacyDialogOpen] = useState(false);
-  const { modelType } = useAuthStore();
+  const { modelType, token } = useAuthStore();
+  const [subscriptionUsage, setSubscriptionUsage] =
+    useState<SubscriptionLimitInfo | null>(null);
+  const [currentCredits, setCurrentCredits] = useState<number | null>(null);
+  const [cloudUsageLimitReached, setCloudUsageLimitReached] = useState(false);
+  const [dismissedUsageLimitBannerId, setDismissedUsageLimitBannerId] =
+    useState<string | null>(null);
+
+  const refreshUsageLimits = useCallback(async () => {
+    if (modelType !== 'cloud' || !token) {
+      setSubscriptionUsage(null);
+      setCurrentCredits(null);
+      return;
+    }
+
+    const [subscriptionResult, creditsResult] = await Promise.allSettled([
+      proxyFetchGet('/api/v1/subscription'),
+      proxyFetchGet('/api/v1/user/current_credits'),
+    ]);
+
+    if (subscriptionResult.status === 'fulfilled') {
+      setSubscriptionUsage(subscriptionResult.value || null);
+    }
+
+    if (creditsResult.status === 'fulfilled') {
+      setCurrentCredits(toFiniteNumber(creditsResult.value?.credits));
+    }
+  }, [modelType, token]);
+
+  const scheduleUsageRefresh = useCallback(() => {
+    window.setTimeout(refreshUsageLimits, 2000);
+    window.setTimeout(refreshUsageLimits, 15000);
+  }, [refreshUsageLimits]);
+
+  const usageLimitBannerState = useMemo(
+    () => buildUsageLimitBannerState(subscriptionUsage, currentCredits, t),
+    [subscriptionUsage, currentCredits, t]
+  );
+
+  const cloudUsageLimitMessage = useMemo(() => {
+    if (modelType !== 'cloud' || !cloudUsageLimitReached) return null;
+    return [
+      usageLimitBannerState?.message ||
+        t('chat.usage-limit-trial-daily-exhausted'),
+      t('chat.usage-limit-switch-model-hint'),
+    ].join(' ');
+  }, [modelType, cloudUsageLimitReached, usageLimitBannerState, t]);
+
+  const effectiveUsageLimitBannerState = useMemo(() => {
+    if (!cloudUsageLimitMessage) return usageLimitBannerState;
+
+    return {
+      id: 'cloud-usage-limit-blocked',
+      message: cloudUsageLimitMessage,
+      actionLabel:
+        usageLimitBannerState?.actionLabel || t('chat.usage-limit-action'),
+      severity: 'danger' as const,
+    };
+  }, [cloudUsageLimitMessage, usageLimitBannerState, t]);
+
+  const usageLimitBanner = useMemo(() => {
+    if (
+      !effectiveUsageLimitBannerState ||
+      effectiveUsageLimitBannerState.id === dismissedUsageLimitBannerId
+    ) {
+      return null;
+    }
+
+    return {
+      ...effectiveUsageLimitBannerState,
+      onAction: () => {
+        window.location.href = `${SITE_URL}/pricing`;
+      },
+      onDismiss: () => {
+        setDismissedUsageLimitBannerId(effectiveUsageLimitBannerState.id);
+      },
+    };
+  }, [effectiveUsageLimitBannerState, dismissedUsageLimitBannerId]);
+
+  useEffect(() => {
+    refreshUsageLimits();
+
+    if (modelType !== 'cloud' || !token) return;
+
+    const intervalId = window.setInterval(refreshUsageLimits, 60000);
+    window.addEventListener('focus', refreshUsageLimits);
+
+    return () => {
+      window.clearInterval(intervalId);
+      window.removeEventListener('focus', refreshUsageLimits);
+    };
+  }, [modelType, token, refreshUsageLimits]);
+
   const [useCloudModelInDev, setUseCloudModelInDev] = useState(false);
   useEffect(() => {
     // Only show warning message, don't block functionality
@@ -62,21 +307,63 @@ export default function ChatBox(): JSX.Element {
       setUseCloudModelInDev(false);
     }
   }, [modelType]);
-  useEffect(() => {
-    proxyFetchGet('/api/user/privacy')
-      .then((res) => {
-        let _privacy = 0;
-        Object.keys(res).forEach((key) => {
-          if (!res[key]) {
-            _privacy++;
-            return;
-          }
-        });
-        setPrivacy(_privacy === 0 ? true : false);
-      })
-      .catch((err) => console.error('Failed to fetch settings:', err));
 
-    proxyFetchGet('/api/configs')
+  const [searchParams, setSearchParams] = useSearchParams();
+  const share_token = searchParams.get('share_token');
+  const skill_prompt = searchParams.get('skill_prompt');
+
+  const handleSendRef = useRef<
+    ((messageStr?: string, taskId?: string) => Promise<void>) | null
+  >(null);
+
+  const navigate = useNavigate();
+  const location = useLocation();
+
+  // Shared function to check model configuration
+  const checkModelConfig = useCallback(async () => {
+    try {
+      if (modelType === 'cloud') {
+        // For cloud model, check if API key exists
+        const res = await proxyFetchGet('/api/v1/user/key');
+        if (hasApiCode(res, API_CODE_TRIAL_LIMIT)) {
+          setCloudUsageLimitReached(true);
+          setHasModel(false);
+          refreshUsageLimits();
+          return;
+        }
+        setCloudUsageLimitReached(false);
+        setHasModel(!!res.value);
+      } else if (modelType === 'local' || modelType === 'custom') {
+        setCloudUsageLimitReached(false);
+        // For local/custom model, check if provider exists
+        const res = await proxyFetchGet('/api/v1/providers', { prefer: true });
+        const providerList = res.items || [];
+        setHasModel(providerList.length > 0);
+      } else {
+        setCloudUsageLimitReached(false);
+        setHasModel(false);
+      }
+    } catch (err: any) {
+      console.error('Failed to check model config:', err);
+      if (
+        modelType === 'cloud' &&
+        hasApiCode(err?.response?.data, API_CODE_TRIAL_LIMIT)
+      ) {
+        setCloudUsageLimitReached(true);
+        setHasModel(false);
+        refreshUsageLimits();
+        return;
+      }
+      setCloudUsageLimitReached(false);
+      setHasModel(false);
+    } finally {
+      setIsConfigLoaded(true);
+    }
+  }, [modelType, refreshUsageLimits]);
+
+  // Check model config on mount and when modelType changes
+  useEffect(() => {
+    proxyFetchGet('/api/v1/configs')
       .then((configsRes) => {
         const configs = Array.isArray(configsRes) ? configsRes : [];
         const _hasApiKey = configs.find(
@@ -88,34 +375,29 @@ export default function ChatBox(): JSX.Element {
         if (_hasApiKey && _hasApiId) setHasSearchKey(true);
       })
       .catch((err) => console.error('Failed to fetch configs:', err));
-  }, []);
 
-  // Refresh privacy status when dialog closes
-  // useEffect(() => {
-  // 	if (!privacyDialogOpen) {
-  // 		proxyFetchGet("/api/user/privacy")
-  // 			.then((res) => {
-  // 				let _privacy = 0;
-  // 				Object.keys(res).forEach((key) => {
-  // 					if (!res[key]) {
-  // 						_privacy++;
-  // 						return;
-  // 					}
-  // 				});
-  // 				setPrivacy(_privacy === 0 ? true : false);
-  // 			})
-  // 			.catch((err) => console.error("Failed to fetch settings:", err));
-  // 	}
-  // }, [privacyDialogOpen]);
-  const [searchParams, setSearchParams] = useSearchParams();
-  const share_token = searchParams.get('share_token');
-  const skill_prompt = searchParams.get('skill_prompt');
+    checkModelConfig();
+  }, [modelType, checkModelConfig]);
 
-  const handleSendRef = useRef<
-    ((messageStr?: string, taskId?: string) => Promise<void>) | null
-  >(null);
+  // Re-check model config when returning from settings page
+  useEffect(() => {
+    // Check when location changes (user navigates)
+    if (location.pathname === '/') {
+      checkModelConfig();
+    }
+  }, [location.pathname, checkModelConfig]);
 
-  const navigate = useNavigate();
+  // Also check when window gains focus (user returns from settings)
+  useEffect(() => {
+    const handleFocus = () => {
+      checkModelConfig();
+    };
+
+    window.addEventListener('focus', handleFocus);
+    return () => {
+      window.removeEventListener('focus', handleFocus);
+    };
+  }, [checkModelConfig]);
 
   // Task time tracking
   const [taskTime, setTaskTime] = useState(
@@ -127,6 +409,7 @@ export default function ChatBox(): JSX.Element {
   const [loading, setLoading] = useState(false);
   const [isReplayLoading, setIsReplayLoading] = useState(false);
   const [isPauseResumeLoading, setIsPauseResumeLoading] = useState(false);
+  const [projectTotalTokens, setProjectTotalTokens] = useState(0);
 
   const activeTaskId = chatStore?.activeTaskId;
   const activeTaskMessages = chatStore?.tasks[activeTaskId as string]?.messages;
@@ -176,6 +459,49 @@ export default function ChatBox(): JSX.Element {
     return projectStore.getAllChatStores(projectStore.activeProjectId);
   }, [projectStore]);
 
+  useEffect(() => {
+    if (!projectStore.activeProjectId) {
+      setProjectTotalTokens(0);
+      return;
+    }
+
+    const chatTotals = new Map<string, number>();
+    let nextProjectTotalTokens = 0;
+
+    getAllChatStoresMemoized.forEach(({ chatId, chatStore }) => {
+      const chatTotalTokens = getChatStoreTotalTokens(chatStore);
+      chatTotals.set(chatId, chatTotalTokens);
+      nextProjectTotalTokens += chatTotalTokens;
+    });
+
+    setProjectTotalTokens(nextProjectTotalTokens);
+
+    const unsubscribers = getAllChatStoresMemoized.map(
+      ({ chatId, chatStore }) =>
+        chatStore.subscribe((state) => {
+          const nextChatTotalTokens = Object.values(state.tasks).reduce(
+            (total, task) =>
+              total + (typeof task.tokens === 'number' ? task.tokens : 0),
+            0
+          );
+          const previousChatTotalTokens = chatTotals.get(chatId) ?? 0;
+
+          if (nextChatTotalTokens === previousChatTotalTokens) {
+            return;
+          }
+
+          chatTotals.set(chatId, nextChatTotalTokens);
+          nextProjectTotalTokens +=
+            nextChatTotalTokens - previousChatTotalTokens;
+          setProjectTotalTokens(nextProjectTotalTokens);
+        })
+    );
+
+    return () => {
+      unsubscribers.forEach((unsubscribe) => unsubscribe());
+    };
+  }, [projectStore.activeProjectId, getAllChatStoresMemoized]);
+
   // Check if any chat store in the project has messages
   const hasAnyMessages = useMemo(() => {
     if (!chatStore) return false;
@@ -222,6 +548,8 @@ export default function ChatBox(): JSX.Element {
     );
   }, [chatStore?.activeTaskId, chatStore?.tasks]);
 
+  const isCloudUsageLimited = modelType === 'cloud' && cloudUsageLimitReached;
+
   const isInputDisabled = useMemo(() => {
     if (!chatStore?.activeTaskId || !chatStore.tasks[chatStore.activeTaskId])
       return true;
@@ -233,9 +561,9 @@ export default function ChatBox(): JSX.Element {
 
     if (isTaskBusy) return true;
 
-    // Standard checks - check model first, then privacy
+    // Standard checks - check model
+    if (isCloudUsageLimited) return true;
     if (!hasModel) return true;
-    if (!privacy) return true;
     if (useCloudModelInDev) return true;
     if (task.isContextExceeded) return true;
 
@@ -243,7 +571,7 @@ export default function ChatBox(): JSX.Element {
   }, [
     chatStore?.activeTaskId,
     chatStore?.tasks,
-    privacy,
+    isCloudUsageLimited,
     hasModel,
     useCloudModelInDev,
     isTaskBusy,
@@ -260,12 +588,15 @@ export default function ChatBox(): JSX.Element {
 
       // Check model configuration before starting task
       if (!hasModel) {
+        if (isCloudUsageLimited) {
+          toast.error(
+            cloudUsageLimitMessage ||
+              t('chat.usage-limit-trial-daily-exhausted')
+          );
+          return;
+        }
         toast.error('Please select a model first.');
         navigate('/history?tab=agents');
-        return;
-      }
-      if (!privacy) {
-        toast.error('Please accept the privacy policy first.');
         return;
       }
 
@@ -273,7 +604,7 @@ export default function ChatBox(): JSX.Element {
       let taskId: string = token.split('__')[1];
       chatStore.create(taskId, 'share');
       chatStore.setHasMessages(taskId, true);
-      const res = await proxyFetchGet(`/api/chat/share/info/${_token}`);
+      const res = await proxyFetchGet(`/api/v1/chat/share/info/${_token}`);
       if (res?.question) {
         chatStore.addMessages(taskId, {
           id: generateUniqueId(),
@@ -297,7 +628,15 @@ export default function ChatBox(): JSX.Element {
         }
       }
     },
-    [chatStore, projectStore.activeProjectId, hasModel, privacy, navigate]
+    [
+      chatStore,
+      projectStore.activeProjectId,
+      hasModel,
+      isCloudUsageLimited,
+      cloudUsageLimitMessage,
+      navigate,
+      t,
+    ]
   );
 
   // Handle skill_prompt from URL - pre-fill message when navigating from Skills page
@@ -365,14 +704,16 @@ export default function ChatBox(): JSX.Element {
     const _taskId = taskId || chatStore.activeTaskId;
     if (message.trim() === '' && !messageStr) return;
 
-    // Check model first, then privacy
+    // Check model configuration
     if (!hasModel) {
+      if (isCloudUsageLimited) {
+        toast.error(
+          cloudUsageLimitMessage || t('chat.usage-limit-trial-daily-exhausted')
+        );
+        return;
+      }
       toast.error('Please select a model first.');
       navigate('/history?tab=agents');
-      return;
-    }
-    if (!privacy) {
-      toast.error('Please accept the privacy policy first.');
       return;
     }
     const tempMessageContent = messageStr || message;
@@ -549,23 +890,6 @@ export default function ChatBox(): JSX.Element {
             setMessage('');
           }
         } else {
-          if (!privacy) {
-            const API_FIELDS = [
-              'take_screenshot',
-              'access_local_software',
-              'access_your_address',
-              'password_storage',
-            ];
-            const requestData = {
-              [API_FIELDS[0]]: true,
-              [API_FIELDS[1]]: true,
-              [API_FIELDS[2]]: true,
-              [API_FIELDS[3]]: true,
-            };
-            proxyFetchPut('/api/user/privacy', requestData);
-            setPrivacy(true);
-          }
-
           setTimeout(() => {
             scrollToBottom();
           }, 200);
@@ -599,6 +923,8 @@ export default function ChatBox(): JSX.Element {
       }
     } catch (error) {
       console.error('error:', error);
+    } finally {
+      scheduleUsageRefresh();
     }
   };
 
@@ -677,11 +1003,11 @@ export default function ChatBox(): JSX.Element {
   }, [projectStore]);
 
   useEffect(() => {
-    // Wait for both config and privacy to be loaded before handling share token
-    if (share_token) {
+    // Wait for config to be loaded before handling share token
+    if (share_token && isConfigLoaded) {
       handleSendShare(share_token);
     }
-  }, [share_token, handleSendShare]);
+  }, [share_token, isConfigLoaded, handleSendShare]);
 
   if (!chatStore) {
     return <div>Loading...</div>;
@@ -863,7 +1189,7 @@ export default function ChatBox(): JSX.Element {
     const history_id = projectStore.getHistoryId(projectId);
     if (history_id) {
       try {
-        await proxyFetchDelete(`/api/chat/history/${history_id}`);
+        await proxyFetchDelete(`/api/v1/chat/history/${history_id}`);
       } catch (error) {
         console.error(
           `Failed to delete chat history (ID: ${history_id}) for project ${projectId}:`,
@@ -989,13 +1315,13 @@ export default function ChatBox(): JSX.Element {
   }
 
   return (
-    <div className="rounded-2xl border-border-tertiary bg-surface-secondary h-full w-full flex-none items-center justify-center overflow-hidden border-solid">
+    <div className="h-full w-full flex-none items-center justify-center overflow-hidden rounded-2xl border-solid border-border-tertiary bg-surface-secondary">
       {/* Unified ChatBox Structure */}
       <div className="relative flex h-full w-full flex-col overflow-hidden">
         {/* Header Box - Always visible */}
         {chatStore.activeTaskId && (
           <HeaderBox
-            tokens={chatStore.tasks[chatStore.activeTaskId]?.tokens || 0}
+            totalTokens={projectTotalTokens}
             status={chatStore.tasks[chatStore.activeTaskId]?.status}
             replayLoading={isReplayLoading}
             onReplay={handleReplay}
@@ -1006,10 +1332,10 @@ export default function ChatBox(): JSX.Element {
         <div className="relative flex flex-1 flex-col overflow-hidden">
           {/* Project Chat Container - Show when has messages (absolute, full height) */}
           <div
-            className={`inset-0 ease-in-out absolute flex h-full flex-col transition-all duration-300 ${
+            className={`absolute inset-0 flex h-full flex-col transition-all duration-300 ease-in-out ${
               hasAnyMessages
-                ? 'translate-y-0 pointer-events-auto opacity-100'
-                : '-translate-y-4 pointer-events-none opacity-0'
+                ? 'pointer-events-auto translate-y-0 opacity-100'
+                : 'pointer-events-none -translate-y-4 opacity-0'
             }`}
           >
             <ProjectChatContainer
@@ -1020,15 +1346,15 @@ export default function ChatBox(): JSX.Element {
 
           {/* Init State Container - Welcome + BottomBox + Suggestions (vertically centered) */}
           <div
-            className={`ease-in-out flex flex-1 flex-col transition-all duration-300 ${
+            className={`flex flex-1 flex-col transition-all duration-300 ease-in-out ${
               hasAnyMessages
-                ? 'inset-0 pointer-events-none absolute opacity-0'
+                ? 'pointer-events-none absolute inset-0 opacity-0'
                 : 'pointer-events-auto opacity-100'
             }`}
           >
             {/* Welcome Message - Top area, flex-1 to push content down */}
-            <div className="gap-1 pb-4 flex flex-1 flex-col items-center justify-end">
-              <div className="text-body-lg font-bold text-text-heading text-center">
+            <div className="flex flex-1 flex-col items-center justify-end gap-1 pb-4">
+              <div className="text-center text-body-lg font-bold text-text-heading">
                 {t('layout.welcome-to-eigent')}
               </div>
             </div>
@@ -1039,6 +1365,7 @@ export default function ChatBox(): JSX.Element {
                 state="input"
                 queuedMessages={queuedMessages}
                 onRemoveQueuedMessage={(id) => handleRemoveTaskQueue(id)}
+                usageLimitBanner={usageLimitBanner}
                 inputProps={{
                   value: message,
                   onChange: setMessage,
@@ -1060,85 +1387,40 @@ export default function ChatBox(): JSX.Element {
                   disabled: isInputDisabled,
                   textareaRef: textareaRef,
                   allowDragDrop: true,
-                  privacy: privacy,
                   useCloudModelInDev: useCloudModelInDev,
                 }}
               />
             )}
 
             {/* Suggestion Area - Bottom area, flex-1 to push content up */}
-            <div className="mt-3 gap-2 flex h-[210px] flex-1 items-start justify-center">
-              {!hasModel ? (
-                <div className="gap-2 flex items-center">
+            <div className="mt-3 flex h-[210px] flex-1 items-start justify-center gap-2">
+              {isCloudUsageLimited ? (
+                <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-2 rounded-md bg-surface-warning px-sm py-xs">
+                    <TriangleAlert size={20} className="text-icon-warning" />
+                    <span className="flex-1 text-xs font-medium leading-[20px] text-text-warning">
+                      {cloudUsageLimitMessage ||
+                        t('chat.usage-limit-trial-daily-exhausted')}
+                    </span>
+                  </div>
+                </div>
+              ) : !hasModel ? (
+                <div className="flex items-center gap-2">
                   <div
                     onClick={() => {
                       navigate('/history?tab=agents');
                     }}
-                    className="gap-2 rounded-md bg-surface-warning px-sm py-xs flex cursor-pointer items-center"
+                    className="flex cursor-pointer items-center gap-2 rounded-md bg-surface-warning px-sm py-xs"
                   >
                     <TriangleAlert size={20} className="text-icon-warning" />
-                    <span className="text-xs font-medium text-text-warning flex-1 leading-[20px]">
+                    <span className="flex-1 text-xs font-medium leading-[20px] text-text-warning">
                       {t('layout.please-select-model')}
                     </span>
                   </div>
                 </div>
               ) : null}
-              {hasModel && !privacy ? (
-                <div className="gap-2 flex items-center">
-                  <div
-                    onClick={(e) => {
-                      const target = e.target as HTMLElement;
-                      if (target.tagName === 'A') {
-                        return;
-                      }
-                      const API_FIELDS = [
-                        'take_screenshot',
-                        'access_local_software',
-                        'access_your_address',
-                        'password_storage',
-                      ];
-                      const requestData = {
-                        [API_FIELDS[0]]: true,
-                        [API_FIELDS[1]]: true,
-                        [API_FIELDS[2]]: true,
-                        [API_FIELDS[3]]: true,
-                      };
-                      proxyFetchPut('/api/user/privacy', requestData);
-                      setPrivacy(true);
-                    }}
-                    className="gap-1 rounded-md bg-surface-information px-sm py-xs flex cursor-pointer items-center"
-                  >
-                    <TriangleAlert
-                      size={20}
-                      className="text-icon-information"
-                    />
-                    <span className="text-xs font-medium text-text-information flex-1 leading-[20px]">
-                      {t('layout.by-messaging-eigent')}{' '}
-                      <a
-                        href="https://www.eigent.ai/terms-of-use"
-                        target="_blank"
-                        className="text-text-information underline"
-                        onClick={(e) => e.stopPropagation()}
-                        rel="noreferrer"
-                      >
-                        {t('layout.terms-of-use')}
-                      </a>{' '}
-                      {t('layout.and')}{' '}
-                      <a
-                        href="https://www.eigent.ai/privacy-policy"
-                        target="_blank"
-                        className="text-text-information underline"
-                        onClick={(e) => e.stopPropagation()}
-                        rel="noreferrer"
-                      >
-                        {t('layout.privacy-policy')}
-                      </a>
-                      .
-                    </span>
-                  </div>
-                </div>
-              ) : (
-                <div className="mr-2 gap-2 flex flex-col items-center">
+              {hasModel && !isCloudUsageLimited && (
+                <div className="mr-2 flex flex-col items-center gap-2">
                   {[
                     {
                       label: t('layout.it-ticket-creation'),
@@ -1155,7 +1437,7 @@ export default function ChatBox(): JSX.Element {
                   ].map(({ label, message }) => (
                     <div
                       key={label}
-                      className="rounded-md bg-surface-tertiary px-sm py-xs text-xs font-medium text-button-tertiery-text-default cursor-pointer leading-none opacity-70 transition-all duration-300 hover:opacity-100"
+                      className="cursor-pointer rounded-md bg-surface-tertiary px-sm py-xs text-xs font-medium leading-none text-button-tertiery-text-default opacity-70 transition-all duration-300 hover:opacity-100"
                       onClick={() => {
                         setMessage(message);
                       }}
@@ -1175,6 +1457,7 @@ export default function ChatBox(): JSX.Element {
             state={hasAnyMessages ? getBottomBoxState() : 'input'}
             queuedMessages={queuedMessages}
             onRemoveQueuedMessage={(id) => handleRemoveTaskQueue(id)}
+            usageLimitBanner={usageLimitBanner}
             subtitle={
               hasAnyMessages && getBottomBoxState() === 'confirm'
                 ? (() => {
@@ -1217,7 +1500,6 @@ export default function ChatBox(): JSX.Element {
               disabled: isInputDisabled,
               textareaRef: textareaRef,
               allowDragDrop: hasAnyMessages,
-              privacy: hasAnyMessages ? privacy : true,
               useCloudModelInDev: useCloudModelInDev,
             }}
           />

@@ -25,6 +25,7 @@ from app.controller import (
     chat_controller,
     health_controller,
     model_controller,
+    remote_sub_agent_controller,
     task_controller,
     tool_controller,
 )
@@ -62,6 +63,11 @@ def register_routers(app: FastAPI, prefix: str = "") -> None:
             "description": "Model validation and configuration",
         },
         {
+            "router": remote_sub_agent_controller.router,
+            "tags": ["remote-sub-agent"],
+            "description": "Remote sub-agent validation",
+        },
+        {
             "router": task_controller.router,
             "tags": ["task"],
             "description": "Task lifecycle management (start, stop, update, control)",
@@ -72,6 +78,11 @@ def register_routers(app: FastAPI, prefix: str = "") -> None:
             "description": "Tool installation and management",
         },
     ]
+
+    app.include_router(health_controller.router, tags=["Health"])
+    logger.info(
+        "Registered Health router at root level for Docker health checks"
+    )
 
     for config in routers_config:
         app.include_router(

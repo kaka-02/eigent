@@ -26,7 +26,6 @@ from app.agent.toolkit.github_toolkit import GithubToolkit
 from app.agent.toolkit.google_calendar_toolkit import GoogleCalendarToolkit
 from app.agent.toolkit.google_drive_mcp_toolkit import GoogleDriveMCPToolkit
 from app.agent.toolkit.google_gmail_mcp_toolkit import GoogleGmailMCPToolkit
-from app.agent.toolkit.image_analysis_toolkit import ImageAnalysisToolkit
 from app.agent.toolkit.lark_toolkit import LarkToolkit
 from app.agent.toolkit.linkedin_toolkit import LinkedInToolkit
 from app.agent.toolkit.mcp_search_toolkit import McpSearchToolkit
@@ -35,6 +34,7 @@ from app.agent.toolkit.openai_image_toolkit import OpenAIImageToolkit
 from app.agent.toolkit.pptx_toolkit import PPTXToolkit
 from app.agent.toolkit.rag_toolkit import RAGToolkit
 from app.agent.toolkit.reddit_toolkit import RedditToolkit
+from app.agent.toolkit.remote_sub_agent_toolkit import RemoteSubAgentToolkit
 from app.agent.toolkit.search_toolkit import SearchToolkit
 from app.agent.toolkit.slack_toolkit import SlackToolkit
 from app.agent.toolkit.terminal_toolkit import TerminalToolkit
@@ -62,7 +62,6 @@ async def get_toolkits(tools: list[str], agent_name: str, api_task_id: str):
         "google_calendar_toolkit": GoogleCalendarToolkit,
         "google_drive_mcp_toolkit": GoogleDriveMCPToolkit,
         "google_gmail_mcp_toolkit": GoogleGmailMCPToolkit,
-        "image_analysis_toolkit": ImageAnalysisToolkit,
         "linkedin_toolkit": LinkedInToolkit,
         "lark_toolkit": LarkToolkit,
         "mcp_search_toolkit": McpSearchToolkit,
@@ -70,6 +69,7 @@ async def get_toolkits(tools: list[str], agent_name: str, api_task_id: str):
         "pptx_toolkit": PPTXToolkit,
         "rag_toolkit": RAGToolkit,
         "reddit_toolkit": RedditToolkit,
+        "remote_sub_agent_toolkit": RemoteSubAgentToolkit,
         "search_toolkit": SearchToolkit,
         "slack_toolkit": SlackToolkit,
         "terminal_toolkit": TerminalToolkit,
